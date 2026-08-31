@@ -2,7 +2,7 @@
  * =================================================================
  * MEDIBOT v5.0 - Solución Dual-Core (FreeRTOS)
  * =================================================================
- * - Core 0: Lectura exclusiva y continua del MAX30105 (BPM y SpO2)
+ * - Core 0: Lectura exclusiva y continua del MAX30105 y MLX90614
  * - Core 1: Renderizado OLED (U8g2), animaciones y máquina de estados
  * =================================================================
  */
@@ -14,6 +14,7 @@
 #include "MAX30105.h"
 #include "heartRate.h"
 #include "spo2_algorithm.h"
+#include <Adafruit_MLX90614.h> // LIBRERÍA AGREGADA PARA EL SENSOR MLX
 
 // --- PINES DE HARDWARE (ESP32) ---
 #define OLED_CS_PIN     5
@@ -30,6 +31,10 @@ enum AppState {
   STATE_MENU,  
   STATE_TRIAGE_FINGER_REQ,
   STATE_TRIAGE_FINGER_READ,
+  STATE_TRIAGE_FINGER_HOLD, // NUEVO: Mantiene lectura de dedo 5 seg
+  STATE_TRIAGE_WRIST_REQ,   // NUEVO: Pide muñeca
+  STATE_TRIAGE_WRIST_READ,  // NUEVO: Lee temperatura
+  STATE_TRIAGE_WRIST_HOLD,  // NUEVO: Mantiene lectura de muñeca 5 seg
   STATE_TRIAGE_RESULT,
   STATE_ABOUT
 };
@@ -50,12 +55,13 @@ unsigned long lastButtonTime = 0;
 unsigned long lastInteractionTime = 0;
 unsigned long stateTimer = 0;
 volatile unsigned long noDetectionTimer = 0; 
+volatile unsigned long holdTimer = 0; // NUEVO: Temporizador para las pausas de 5 segundos
 int animFrame = 0;
 
 // Variables Clínicas Compartidas (Volatile)
 volatile int patientBPM = 0;
 volatile int patientSpO2 = 0;
-float patientTemp = 36.5; 
+volatile float patientTemp = 0.0; // MODIFICADO PARA SER ACTUALIZADO POR EL SENSOR
 bool isBlinking = false;
 
 // Acumuladores para Promedios
@@ -63,13 +69,19 @@ volatile long sumBPM = 0;
 volatile long sumSpO2 = 0;
 volatile int validReadingsCount = 0;
 
+volatile float sumTemp = 0.0;     // NUEVO: Acumulador de temperatura
+volatile int validTempCount = 0;  // NUEVO: Conteo de muestras de temperatura
+
 // Variables en Vivo Compartidas
 volatile int liveBPM = 0;
 volatile int liveSpO2 = 0;
 volatile bool isSpO2ValidLive = false;
+volatile float liveTemp = 0.0; // NUEVO: Temperatura en vivo
 
-// --- VARIABLES SENSOR PULSO ---
+// --- VARIABLES SENSOR PULSO Y TEMP ---
 MAX30105 particleSensor;
+Adafruit_MLX90614 mlx = Adafruit_MLX90614(); // NUEVO: Objeto MLX
+
 const byte RATE_SIZE = 4; 
 byte rates[RATE_SIZE]; 
 byte rateSpot = 0;
@@ -189,19 +201,43 @@ void sensorTaskCode(void * pvParameters) {
           patientBPM = sumBPM / validReadingsCount;
           patientSpO2 = sumSpO2 / validReadingsCount;
           
-          evaluateDiagnoses(); 
-          currentState = STATE_TRIAGE_RESULT;
-          resultPage = 0;
-          
-          if (patientBPM > 100 || patientBPM < 60 || patientSpO2 < 92) {
-            currentEmotion = EMOTION_SAD; 
-          } else {
-            currentEmotion = EMOTION_HAPPY; 
-          }
+          // MODIFICADO: Pasa a HOLD en lugar de a RESULT
+          currentState = STATE_TRIAGE_FINGER_HOLD;
+          holdTimer = millis(); 
         }
       }
       // Pausa microscópica para evitar 'watchdog reset' en Core 0
       vTaskDelay(2 / portTICK_PERIOD_MS);
+      
+    } else if (currentState == STATE_TRIAGE_WRIST_READ) {
+      // NUEVO: LÓGICA MLX IDÉNTICA AL PROCESO DEL MAX
+      liveTemp = mlx.readObjectTempC();
+      
+      // Asumimos que si lee menos de 30C no hay muñeca
+      if (liveTemp < 30.0) {
+        sumTemp = 0;
+        validTempCount = 0;
+        
+        if (millis() - noDetectionTimer > 10000) {
+          currentState = STATE_MENU;
+          currentEmotion = EMOTION_NORMAL;
+          needsRedraw = true;
+        }
+      } else {
+        noDetectionTimer = millis();
+        
+        sumTemp += liveTemp;
+        validTempCount++;
+        
+        if (validTempCount >= 12) {
+          patientTemp = sumTemp / validTempCount;
+          
+          currentState = STATE_TRIAGE_WRIST_HOLD;
+          holdTimer = millis();
+        }
+      }
+      vTaskDelay(100 / portTICK_PERIOD_MS); // Un delay mayor porque la temp no requiere tanto refresco
+
     } else {
       // Si no se está en lectura de triage, poner en reposo el hilo en Core 0
       vTaskDelay(100 / portTICK_PERIOD_MS);
@@ -225,6 +261,9 @@ void setup() {
     particleSensor.setPulseAmplitudeRed(0x3F);
     particleSensor.setPulseAmplitudeIR(0x3F);
   }
+
+  // NUEVO: Iniciar sensor MLX
+  mlx.begin();
   
   pinMode(KEYPAD_PIN, INPUT);
   lastInteractionTime = millis();
@@ -260,7 +299,7 @@ void loop() {
     needsRedraw = true;
   }
 
-  // Transición automática al entrar a lectura
+  // Transición automática al entrar a lectura DEDO
   if (currentState == STATE_TRIAGE_FINGER_REQ && animFrame > 40) {
     currentState = STATE_TRIAGE_FINGER_READ;
     currentEmotion = EMOTION_LOADING;
@@ -272,9 +311,45 @@ void loop() {
     noDetectionTimer = millis(); 
   }
 
-  // Timeout por inactividad
+  // NUEVO: Transición automática del FINGER HOLD -> WRIST REQ (5 segundos)
+  if (currentState == STATE_TRIAGE_FINGER_HOLD && millis() - holdTimer >= 5000) {
+    currentState = STATE_TRIAGE_WRIST_REQ;
+    currentEmotion = EMOTION_LOOK_UP; // Ojos viendo hacia arriba
+    animFrame = 0;
+    needsRedraw = true;
+  }
+
+  // NUEVO: Transición automática al entrar a lectura MUÑECA
+  if (currentState == STATE_TRIAGE_WRIST_REQ && animFrame > 40) {
+    currentState = STATE_TRIAGE_WRIST_READ;
+    currentEmotion = EMOTION_LOADING;
+    animFrame = 0;
+    sumTemp = 0.0;
+    validTempCount = 0;
+    noDetectionTimer = millis(); 
+  }
+
+  // NUEVO: Transición automática del WRIST HOLD -> RESULTADOS (5 segundos)
+  if (currentState == STATE_TRIAGE_WRIST_HOLD && millis() - holdTimer >= 5000) {
+    evaluateDiagnoses(); 
+    currentState = STATE_TRIAGE_RESULT;
+    resultPage = 0;
+    
+    if (patientBPM > 100 || patientBPM < 60 || patientSpO2 < 92 || patientTemp > 37.5) {
+      currentEmotion = EMOTION_SAD; 
+    } else {
+      currentEmotion = EMOTION_HAPPY; 
+    }
+    needsRedraw = true;
+  }
+
+  // Timeout por inactividad MODIFICADO para los nuevos estados
   if (currentState != STATE_IDLE_FACE && 
       currentState != STATE_TRIAGE_FINGER_READ && 
+      currentState != STATE_TRIAGE_FINGER_HOLD && 
+      currentState != STATE_TRIAGE_WRIST_REQ && 
+      currentState != STATE_TRIAGE_WRIST_READ && 
+      currentState != STATE_TRIAGE_WRIST_HOLD && 
       (millis() - lastInteractionTime > INACTIVITY_TIMEOUT)) {
     currentState = STATE_IDLE_FACE;
     currentEmotion = EMOTION_NORMAL;
@@ -326,6 +401,52 @@ void loop() {
           }
           drawCenteredStr(58, buf);
         }
+        break;
+      }
+
+      // NUEVO: Pantalla que mantiene el resultado del dedo 5 seg
+      case STATE_TRIAGE_FINGER_HOLD: {
+        drawAvatar(EMOTION_HAPPY, animFrame, 64, 18, 0.60);
+        u8g2.setFont(u8g2_font_6x10_tr);
+        char buf[32];
+        sprintf(buf, "BPM: %d", patientBPM);
+        drawCenteredStr(46, buf);
+        sprintf(buf, "SpO2: %d%%", patientSpO2);
+        drawCenteredStr(58, buf);
+        break;
+      }
+
+      // NUEVO: Pantalla pidiendo muñeca (Viendo hacia arriba)
+      case STATE_TRIAGE_WRIST_REQ: {
+        drawAvatar(EMOTION_LOOK_UP, animFrame, 64, 20, 0.65);
+        u8g2.setFont(u8g2_font_6x10_tr);
+        drawCenteredStr(50, "Coloque su muneca"); 
+        drawCenteredStr(62, "en el sensor"); 
+        break;
+      }
+
+      // NUEVO: Pantalla leyendo muñeca
+      case STATE_TRIAGE_WRIST_READ: {
+        drawAvatar(EMOTION_LOADING, animFrame, 64, 18, 0.60);
+        u8g2.setFont(u8g2_font_6x10_tr);
+        
+        if (liveTemp < 30.0) {
+          drawCenteredStr(56, "Esperando muneca...");
+        } else {
+          char buf[32];
+          sprintf(buf, "Temp: %.1f C", liveTemp);
+          drawCenteredStr(52, buf);
+        }
+        break;
+      }
+
+      // NUEVO: Pantalla que mantiene el resultado de la muñeca 5 seg
+      case STATE_TRIAGE_WRIST_HOLD: {
+        drawAvatar(EMOTION_HAPPY, animFrame, 64, 18, 0.60);
+        u8g2.setFont(u8g2_font_6x10_tr);
+        char buf[32];
+        sprintf(buf, "Temp: %.1f C", patientTemp);
+        drawCenteredStr(52, buf);
         break;
       }
 
