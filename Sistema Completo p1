@@ -1,18 +1,15 @@
 /*
  * =================================================================
- * MEDIBOT v4.6 - Lecturas en Vivo y Timeout de Seguridad
+ * MEDIBOT v5.0 - Solución Dual-Core (FreeRTOS)
  * =================================================================
- * - Avatar mira abajo (dedo) y arriba (muñeca).
- * - Muestra lecturas en vivo durante la medición para verificar.
- * - Timeout de 10 segundos si no se detecta paciente.
- * - Recolecta promedios sin exigir perfección continua.
+ * - Core 0: Lectura exclusiva y continua del MAX30105 (BPM y SpO2)
+ * - Core 1: Renderizado OLED (U8g2), animaciones y máquina de estados
  * =================================================================
  */
 
 #include <Arduino.h>
 #include <U8g2lib.h>
 #include <SPI.h>
-#include <DHT.h>
 #include <Wire.h>
 #include "MAX30105.h"
 #include "heartRate.h"
@@ -22,25 +19,21 @@
 #define OLED_CS_PIN     5
 #define OLED_RESET_PIN  19
 #define KEYPAD_PIN      34
-#define DHT_PIN         25
 
 // --- CONFIGURACIÓN ---
 #define DEBOUNCE_DELAY  250
 #define INACTIVITY_TIMEOUT 30000 
-#define TEMP_OFFSET     5.5 
 
-// --- MÁQUINA DE ESTADOS ---
+// --- MÁQUINA DE ESTADOS (Volatile por acceso multi-núcleo) ---
 enum AppState {  
   STATE_IDLE_FACE,  
   STATE_MENU,  
   STATE_TRIAGE_FINGER_REQ,
   STATE_TRIAGE_FINGER_READ,
-  STATE_TRIAGE_TEMP_REQ,
-  STATE_TRIAGE_TEMP_READ,
   STATE_TRIAGE_RESULT,
   STATE_ABOUT
 };
-AppState currentState = STATE_IDLE_FACE;
+volatile AppState currentState = STATE_IDLE_FACE;
 
 // --- EXPRESIONES Y CONTROLES ---
 enum Emotion { EMOTION_NORMAL, EMOTION_LOOK_DOWN, EMOTION_LOOK_UP, EMOTION_HAPPY, EMOTION_SAD, EMOTION_LOADING };
@@ -56,28 +49,24 @@ bool needsRedraw = true;
 unsigned long lastButtonTime = 0;
 unsigned long lastInteractionTime = 0;
 unsigned long stateTimer = 0;
-unsigned long lastDhtRead = 0;
-unsigned long noDetectionTimer = 0; // Temporizador para cancelar a los 10 segundos
+volatile unsigned long noDetectionTimer = 0; 
 int animFrame = 0;
 
-// Variables Clínicas Finales (Promedios)
-int patientBPM = 0;
-int patientSpO2 = 0;
-float patientTemp = 0.0;
+// Variables Clínicas Compartidas (Volatile)
+volatile int patientBPM = 0;
+volatile int patientSpO2 = 0;
+float patientTemp = 36.5; 
 bool isBlinking = false;
 
 // Acumuladores para Promedios
-long sumBPM = 0;
-long sumSpO2 = 0;
-int validReadingsCount = 0;
-float tempSum = 0.0;
-int dhtReadsCount = 0;
+volatile long sumBPM = 0;
+volatile long sumSpO2 = 0;
+volatile int validReadingsCount = 0;
 
-// Variables en Vivo (Para mostrar en pantalla)
-int liveBPM = 0;
-int liveSpO2 = 0;
-float liveTemp = 0.0;
-bool isSpO2ValidLive = false;
+// Variables en Vivo Compartidas
+volatile int liveBPM = 0;
+volatile int liveSpO2 = 0;
+volatile bool isSpO2ValidLive = false;
 
 // --- VARIABLES SENSOR PULSO ---
 MAX30105 particleSensor;
@@ -98,14 +87,16 @@ int32_t dummyHeartRate = 0;
 int8_t validDummyHR = 0;
 int sampleCount = 0;
 
-// Resultados en texto simple
+// Resultados en texto
 char diagnosis1[32];
 char diagnosis2[32];
 char diagnosis3[32];
 
-// Inicialización
+// Inicialización de Pantalla
 U8G2_ST7920_128X64_F_HW_SPI u8g2(U8G2_R0, OLED_CS_PIN, OLED_RESET_PIN);
-DHT dht(DHT_PIN, DHT11);
+
+// Manejador de Tarea para Core 0
+TaskHandle_t SensorTaskHandle = NULL;
 
 // Declaración de funciones
 void drawAvatar(Emotion emo, int frame, int cx, int cy, float s);
@@ -117,6 +108,110 @@ Button readAnalogKeypad();
 void drawCenteredStr(int y, const char* text);
 void evaluateDiagnoses();
 
+// =================================================================
+// TAREA DEDICADA AL SENSOR (SE EJECUTA EN CORE 0)
+// =================================================================
+void sensorTaskCode(void * pvParameters) {
+  for (;;) {
+    if (currentState == STATE_TRIAGE_FINGER_READ) {
+      long irValue = particleSensor.getIR();
+      long redValue = particleSensor.getRed();
+
+      if (irValue < 50000) {
+        beatAvg = 0;
+        beatsPerMinute = 0;
+        spo2 = 0;
+        sampleCount = 0;
+        liveBPM = 0;
+        isSpO2ValidLive = false;
+        
+        if (millis() - noDetectionTimer > 10000) {
+          currentState = STATE_MENU;
+          currentEmotion = EMOTION_NORMAL;
+          needsRedraw = true;
+        }
+      } else {
+        noDetectionTimer = millis();
+        
+        // Detección de pulso sin interrupciones de pantalla
+        bool beatDetected = checkForBeat(irValue);
+        if (beatDetected) {
+          long delta = millis() - lastBeat;
+          lastBeat = millis();
+          beatsPerMinute = 60 / (delta / 1000.0);
+
+          if (beatsPerMinute < 255 && beatsPerMinute > 40) {
+            rates[rateSpot++] = (byte)beatsPerMinute; 
+            rateSpot %= RATE_SIZE;
+            beatAvg = 0;
+            for (byte x = 0; x < RATE_SIZE; x++) beatAvg += rates[x];
+            beatAvg /= RATE_SIZE;
+          }
+        }
+
+        // Monitor Serial (opcional para depurar en Core 0)
+        Serial.print("[Core 0] IR: "); Serial.print(irValue);
+        Serial.print("\tBeat: "); Serial.print(beatDetected ? "SI" : "-");
+        Serial.print("\tBPM: "); Serial.println(beatAvg);
+
+        // Llenado de buffer para algoritmo SpO2
+        if (sampleCount < BUFFER_SIZE) {
+          redBuffer[sampleCount] = redValue;
+          irBuffer[sampleCount] = irValue;
+          sampleCount++;
+        } else {
+          maxim_heart_rate_and_oxygen_saturation(irBuffer, bufferLength, redBuffer, &spo2, &validSPO2, &dummyHeartRate, &validDummyHR);
+          for (int i = 50; i < BUFFER_SIZE; i++) {
+            redBuffer[i - 50] = redBuffer[i];
+            irBuffer[i - 50] = irBuffer[i];
+          }
+          sampleCount = 50;
+        }
+
+        int spo2Calibrado = spo2 - 3; 
+
+        liveBPM = beatAvg;
+        if (validSPO2 == 1 && spo2Calibrado >= 50 && spo2Calibrado <= 100) {
+          liveSpO2 = spo2Calibrado;
+          isSpO2ValidLive = true;
+          
+          if (liveBPM >= 40 && liveBPM <= 160) {
+            sumBPM += liveBPM;
+            sumSpO2 += liveSpO2;
+            validReadingsCount++;
+          }
+        } else {
+          isSpO2ValidLive = false;
+        }
+
+        // Al completar 12 lecturas válidas
+        if (validReadingsCount >= 12) {
+          patientBPM = sumBPM / validReadingsCount;
+          patientSpO2 = sumSpO2 / validReadingsCount;
+          
+          evaluateDiagnoses(); 
+          currentState = STATE_TRIAGE_RESULT;
+          resultPage = 0;
+          
+          if (patientBPM > 100 || patientBPM < 60 || patientSpO2 < 92) {
+            currentEmotion = EMOTION_SAD; 
+          } else {
+            currentEmotion = EMOTION_HAPPY; 
+          }
+        }
+      }
+      // Pausa microscópica para evitar 'watchdog reset' en Core 0
+      vTaskDelay(2 / portTICK_PERIOD_MS);
+    } else {
+      // Si no se está en lectura de triage, poner en reposo el hilo en Core 0
+      vTaskDelay(100 / portTICK_PERIOD_MS);
+    }
+  }
+}
+
+// =================================================================
+// SETUP (SE EJECUTA EN CORE 1)
+// =================================================================
 void setup() {
   Serial.begin(115200);
   Wire.begin(21, 22);
@@ -131,15 +226,28 @@ void setup() {
     particleSensor.setPulseAmplitudeIR(0x3F);
   }
   
-  dht.begin();
   pinMode(KEYPAD_PIN, INPUT);
   lastInteractionTime = millis();
+
+  // CREACIÓN DE LA TAREA EN CORE 0
+  xTaskCreatePinnedToCore(
+    sensorTaskCode,   /* Función de la tarea */
+    "SensorTask",     /* Nombre de la tarea */
+    8192,             /* Tamañano de stack (memoria) */
+    NULL,             /* Parámetros */
+    1,                /* Prioridad */
+    &SensorTaskHandle,/* Manejador */
+    0                 /* NÚCLEO 0 */
+  );
 }
 
+// =================================================================
+// LOOP PRINCIPAL (SE EJECUTA EN CORE 1 - MANEJO DE INTERFAZ Y UI)
+// =================================================================
 void loop() {
   processInputs(); 
 
-  // Animación suave
+  // Temporizador de animaciones de cara/ojos
   if (millis() - stateTimer > 50) {
     animFrame++;
     stateTimer = millis();
@@ -152,126 +260,7 @@ void loop() {
     needsRedraw = true;
   }
 
-  // --- ESTADO 1: LECTURA DE PULSO Y OXÍGENO ---
-  if (currentState == STATE_TRIAGE_FINGER_READ) {
-    long irValue = particleSensor.getIR();
-    long redValue = particleSensor.getRed();
-
-    if (irValue < 50000) {
-      // Sin dedo: Reiniciar buffer y revisar si pasaron 10 segundos
-      beatAvg = 0;
-      beatsPerMinute = 0;
-      spo2 = 0;
-      sampleCount = 0;
-      liveBPM = 0;
-      isSpO2ValidLive = false;
-      
-      if (millis() - noDetectionTimer > 10000) {
-        // Se acabó el tiempo
-        currentState = STATE_MENU;
-        currentEmotion = EMOTION_NORMAL;
-        needsRedraw = true;
-      }
-    } else {
-      // Dedo detectado: Reseteamos el temporizador de cancelación
-      noDetectionTimer = millis();
-      
-      if (checkForBeat(irValue) == true) {
-        long delta = millis() - lastBeat;
-        lastBeat = millis();
-        beatsPerMinute = 60 / (delta / 1000.0);
-
-        if (beatsPerMinute < 255 && beatsPerMinute > 40) {
-          rates[rateSpot++] = (byte)beatsPerMinute; 
-          rateSpot %= RATE_SIZE;
-          beatAvg = 0;
-          for (byte x = 0; x < RATE_SIZE; x++) beatAvg += rates[x];
-          beatAvg /= RATE_SIZE;
-        }
-      }
-
-      if (sampleCount < BUFFER_SIZE) {
-        redBuffer[sampleCount] = redValue;
-        irBuffer[sampleCount] = irValue;
-        sampleCount++;
-      } else {
-        maxim_heart_rate_and_oxygen_saturation(irBuffer, bufferLength, redBuffer, &spo2, &validSPO2, &dummyHeartRate, &validDummyHR);
-        for (int i = 50; i < BUFFER_SIZE; i++) {
-          redBuffer[i - 50] = redBuffer[i];
-          irBuffer[i - 50] = irBuffer[i];
-        }
-        sampleCount = 50;
-      }
-
-      int spo2Calibrado = spo2 - 3; 
-
-      // Actualizar variables en vivo para la pantalla
-      liveBPM = beatAvg;
-      if (validSPO2 == 1 && spo2Calibrado >= 50 && spo2Calibrado <= 100) {
-        liveSpO2 = spo2Calibrado;
-        isSpO2ValidLive = true;
-        
-        // Recolectar datos válidos
-        if (liveBPM >= 40 && liveBPM <= 160) {
-          sumBPM += liveBPM;
-          sumSpO2 += liveSpO2;
-          validReadingsCount++;
-        }
-      } else {
-        isSpO2ValidLive = false;
-      }
-
-      // Con 12 lecturas buenas combinadas, calculamos promedios y avanzamos
-      if (validReadingsCount >= 12) {
-        patientBPM = sumBPM / validReadingsCount;
-        patientSpO2 = sumSpO2 / validReadingsCount;
-        
-        currentState = STATE_TRIAGE_TEMP_REQ;
-        currentEmotion = EMOTION_LOOK_UP; // Ahora mira hacia arriba para la muñeca
-        animFrame = 0;
-      }
-    }
-  }
-
-  // --- ESTADO 2: LECTURA DE TEMPERATURA ---
-  else if (currentState == STATE_TRIAGE_TEMP_READ) {
-    
-    // Si no lee nada en 10 segundos, abortamos
-    if (millis() - noDetectionTimer > 10000) {
-      currentState = STATE_MENU;
-      currentEmotion = EMOTION_NORMAL;
-      needsRedraw = true;
-    }
-
-    // Leer el DHT11 cada 2 segundos
-    if (millis() - lastDhtRead > 2000) {
-      lastDhtRead = millis();
-      float realDHT = dht.readTemperature();
-      
-      if (!isnan(realDHT) && realDHT > 10.0 && realDHT < 50.0) {
-        liveTemp = realDHT + TEMP_OFFSET; // Dato en vivo
-        tempSum += liveTemp;
-        dhtReadsCount++;
-        noDetectionTimer = millis(); // Reinicia timeout al tener buena lectura
-      }
-    }
-
-    // Al llegar a 3 lecturas buenas, avanzamos
-    if (dhtReadsCount >= 3) {
-      patientTemp = tempSum / 3.0; // Promedio final
-      evaluateDiagnoses(); 
-      currentState = STATE_TRIAGE_RESULT;
-      resultPage = 0;
-      
-      if (patientTemp > 37.8 || patientBPM > 100 || patientBPM < 60 || patientSpO2 < 92) {
-        currentEmotion = EMOTION_SAD; 
-      } else {
-        currentEmotion = EMOTION_HAPPY; 
-      }
-    }
-  }
-
-  // --- TRANSICIONES AUTOMÁTICAS ---
+  // Transición automática al entrar a lectura
   if (currentState == STATE_TRIAGE_FINGER_REQ && animFrame > 40) {
     currentState = STATE_TRIAGE_FINGER_READ;
     currentEmotion = EMOTION_LOADING;
@@ -280,30 +269,19 @@ void loop() {
     sumBPM = 0;
     sumSpO2 = 0;
     validReadingsCount = 0;
-    noDetectionTimer = millis(); // Inicia timeout
-  }
-  else if (currentState == STATE_TRIAGE_TEMP_REQ && animFrame > 40) {
-    currentState = STATE_TRIAGE_TEMP_READ;
-    currentEmotion = EMOTION_LOADING;
-    animFrame = 0;
-    dhtReadsCount = 0;
-    tempSum = 0;
-    liveTemp = 0.0;
-    lastDhtRead = millis();
-    noDetectionTimer = millis(); // Inicia timeout
+    noDetectionTimer = millis(); 
   }
 
-  // Regresar al inicio si el usuario se va en cualquier otro momento
+  // Timeout por inactividad
   if (currentState != STATE_IDLE_FACE && 
       currentState != STATE_TRIAGE_FINGER_READ && 
-      currentState != STATE_TRIAGE_TEMP_READ && 
       (millis() - lastInteractionTime > INACTIVITY_TIMEOUT)) {
     currentState = STATE_IDLE_FACE;
     currentEmotion = EMOTION_NORMAL;
     needsRedraw = true;
   }
 
-  // --- DIBUJAR PANTALLA ---
+  // RENDERIZADO DE PANTALLA
   if (needsRedraw) {
     u8g2.clearBuffer();
     switch (currentState) {
@@ -327,12 +305,11 @@ void loop() {
       case STATE_TRIAGE_FINGER_READ: {
         drawAvatar(EMOTION_LOADING, animFrame, 64, 18, 0.60);
         u8g2.setFont(u8g2_font_6x10_tr);
-        long irCheck = particleSensor.getIR();
-        if (irCheck < 50000) {
+        
+        // Leemos variables actualizadas por Core 0 en tiempo real
+        if (liveBPM == 0 && !isSpO2ValidLive) {
           drawCenteredStr(56, "Esperando dedo...");
         } else {
-          // Mostrar datos en tiempo real
-          // Mostrar datos en tiempo real
           char buf[32];
           
           if (liveBPM > 0) {
@@ -352,25 +329,6 @@ void loop() {
         break;
       }
 
-      case STATE_TRIAGE_TEMP_REQ:
-        drawAvatar(EMOTION_LOOK_UP, animFrame, 64, 20, 0.65);
-        u8g2.setFont(u8g2_font_6x10_tr);
-        drawCenteredStr(50, "Coloque su muneca");
-        drawCenteredStr(62, "sobre el sensor"); 
-        break;
-        
-      case STATE_TRIAGE_TEMP_READ:
-        drawAvatar(EMOTION_LOADING, animFrame, 64, 18, 0.60);
-        u8g2.setFont(u8g2_font_6x10_tr);
-        if (liveTemp > 0.0) {
-          char buf[32];
-          sprintf(buf, "Temp: %.1f C", liveTemp);
-          drawCenteredStr(52, buf);
-        } else {
-          drawCenteredStr(52, "Tomando lectura...");
-        }
-        break;
-
       case STATE_TRIAGE_RESULT:
         drawTriageResult();
         break;
@@ -380,7 +338,7 @@ void loop() {
   }
 }
 
-// --- TEXTOS DE RESULTADOS AMIGABLES ---
+// --- EVALUACIÓN DE DIAGNÓSTICOS ---
 void evaluateDiagnoses() {
   if (patientBPM > 100) {
     snprintf(diagnosis1, sizeof(diagnosis1), "1. Ritmo cardiaco acelerado");
@@ -398,18 +356,10 @@ void evaluateDiagnoses() {
     snprintf(diagnosis2, sizeof(diagnosis2), "2. Nivel de oxigeno normal");
   }
 
-  if (patientTemp > 38.0) {
-    snprintf(diagnosis3, sizeof(diagnosis3), "3. Fiebre detectada");
-  } else if (patientTemp >= 37.3) {
-    snprintf(diagnosis3, sizeof(diagnosis3), "3. Temperatura un poco alta");
-  } else if (patientTemp < 35.5) {
-    snprintf(diagnosis3, sizeof(diagnosis3), "3. Temperatura corporal baja");
-  } else {
-    snprintf(diagnosis3, sizeof(diagnosis3), "3. Temperatura normal");
-  }
+  snprintf(diagnosis3, sizeof(diagnosis3), "3. Temp: %.1f C (Estable)", patientTemp);
 }
 
-// --- CONTROLES ---
+// --- CONTROLES Y TECLADO ---
 Button readAnalogKeypad() {
   int adc = analogRead(KEYPAD_PIN);
   if (adc < 100) return BTN_DOWN;
@@ -482,7 +432,6 @@ void drawAvatar(Emotion emo, int frame, int cx, int cy, float s) {
   int my = cy + (int)(18 * s);
   int rad = max(1, (int)(5 * s));
 
-  // Cejas
   int ebY = cy - (int)(20 * s); 
   u8g2.setDrawColor(1);
   if (emo == EMOTION_SAD) {
@@ -496,7 +445,6 @@ void drawAvatar(Emotion emo, int frame, int cx, int cy, float s) {
     u8g2.drawBox(rx + (int)(2*s), ebY, eW - (int)(4*s), max(1, (int)(2*s)));
   }
 
-  // Ojos
   if (isBlinking) {
     u8g2.drawRBox(lx, ey + eH/2 - (int)(3*s), eW, max(1, (int)(6*s)), max(1, (int)(2*s)));
     u8g2.drawRBox(rx, ey + eH/2 - (int)(3*s), eW, max(1, (int)(6*s)), max(1, (int)(2*s)));
@@ -522,7 +470,7 @@ void drawAvatar(Emotion emo, int frame, int cx, int cy, float s) {
     }
 
     if (emo == EMOTION_LOOK_DOWN) pyOff = eH - pW - (int)(2*s);
-    else if (emo == EMOTION_LOOK_UP) pyOff = (int)(2*s); // La mirada va hacia arriba
+    else if (emo == EMOTION_LOOK_UP) pyOff = (int)(2*s);
     
     if (emo == EMOTION_LOADING) {
       int animOff = ((frame % 20) - 10) * s;
@@ -534,7 +482,6 @@ void drawAvatar(Emotion emo, int frame, int cx, int cy, float s) {
     }
   }
 
-  // Boca
   u8g2.setDrawColor(1);
   int mRad = max(1, (int)(6 * s));
   if (emo == EMOTION_HAPPY) {
