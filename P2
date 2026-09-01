@@ -1,0 +1,777 @@
+/*
+ * =================================================================
+ * MEDIBOT v5.1 - Solución Dual-Core con Historial y Lecturas Estables
+ * =================================================================
+ * - Core 0: Lectura exclusiva, estricta y promediada del MAX30105 y MLX90614
+ * - Core 1: Renderizado OLED (U8g2), animaciones, historial y menú de 3 opciones
+ * =================================================================
+ */
+
+#include <Arduino.h>
+#include <U8g2lib.h>
+#include <SPI.h>
+#include <Wire.h>
+#include "MAX30105.h"
+#include "heartRate.h"
+#include "spo2_algorithm.h"
+#include <Adafruit_MLX90614.h>
+
+// --- PINES DE HARDWARE (ESP32) ---
+#define OLED_CS_PIN     5
+#define OLED_RESET_PIN  19
+#define KEYPAD_PIN      34
+
+// --- CONFIGURACIÓN ---
+#define DEBOUNCE_DELAY  250
+#define INACTIVITY_TIMEOUT 30000 
+
+// --- MÁQUINA DE ESTADOS ---
+enum AppState {  
+  STATE_IDLE_FACE,  
+  STATE_MENU,  
+  STATE_TRIAGE_FINGER_REQ,
+  STATE_TRIAGE_FINGER_READ,
+  STATE_TRIAGE_FINGER_HOLD, 
+  STATE_TRIAGE_WRIST_REQ,   
+  STATE_TRIAGE_WRIST_READ,  
+  STATE_TRIAGE_WRIST_HOLD,  
+  STATE_TRIAGE_RESULT,
+  STATE_HISTORY,            // NUEVO: Estado para ver el historial
+  STATE_ABOUT
+};
+volatile AppState currentState = STATE_IDLE_FACE;
+
+// --- EXPRESIONES Y CONTROLES ---
+enum Emotion { EMOTION_NORMAL, EMOTION_LOOK_DOWN, EMOTION_LOOK_UP, EMOTION_HAPPY, EMOTION_SAD, EMOTION_LOADING };
+Emotion currentEmotion = EMOTION_NORMAL;
+enum Button {BTN_NONE, BTN_OK, BTN_UP, BTN_DOWN, BTN_BACK};
+
+int mainMenuSelection = 0; // 0: Auto-Chequeo, 1: Historial, 2: Sobre Medibot
+int aboutPage = 0; 
+int resultPage = 0; 
+int historyPage = 0; // NUEVO: Página del historial (0 al 2)
+bool needsRedraw = true;
+
+// --- ESTRUCTURA DE HISTORIAL (Últimos 3 reportes) ---
+struct Report {
+  int bpm;
+  int spo2;
+  float temp;
+  bool recorded;
+};
+Report historyReports[3] = {{0,0,0.0,false}, {0,0,0.0,false}, {0,0,0.0,false}};
+int historyCount = 0;
+
+// Temporizadores
+unsigned long lastButtonTime = 0;
+unsigned long lastInteractionTime = 0;
+unsigned long stateTimer = 0;
+volatile unsigned long noDetectionTimer = 0; 
+volatile unsigned long holdTimer = 0; 
+int animFrame = 0;
+
+// Variables Clínicas Compartidas (Volatile)
+volatile int patientBPM = 0;
+volatile int patientSpO2 = 0;
+volatile float patientTemp = 0.0; 
+bool isBlinking = false;
+
+// Acumuladores para Promedios (Lecturas más lentas y estables)
+volatile long sumBPM = 0;
+volatile long sumSpO2 = 0;
+volatile int validReadingsCount = 0;
+const int TARGET_VALID_READINGS = 45; // Aumentado para buscar un promedio más maduro y real
+
+volatile float sumTemp = 0.0;     
+volatile int validTempCount = 0;  
+const int TARGET_TEMP_READINGS = 35; // Aumentado para mayor estabilidad en temperatura
+
+// Variables en Vivo Compartidas
+volatile int liveBPM = 0;
+volatile int liveSpO2 = 0;
+volatile bool isSpO2ValidLive = false;
+volatile float liveTemp = 0.0; 
+
+// --- VARIABLES SENSOR PULSO Y TEMP ---
+MAX30105 particleSensor;
+Adafruit_MLX90614 mlx = Adafruit_MLX90614(); 
+
+const byte RATE_SIZE = 4; 
+byte rates[RATE_SIZE]; 
+byte rateSpot = 0;
+long lastBeat = 0; 
+float beatsPerMinute = 0;
+int beatAvg = 0;
+
+#define BUFFER_SIZE 100
+uint32_t irBuffer[BUFFER_SIZE];
+uint32_t redBuffer[BUFFER_SIZE];
+int32_t bufferLength = BUFFER_SIZE;
+int32_t spo2 = 0;
+int8_t validSPO2 = 0;
+int32_t dummyHeartRate = 0;
+int8_t validDummyHR = 0;
+int sampleCount = 0;
+
+// Resultados en texto
+char diagnosis1[32];
+char diagnosis2[32];
+char diagnosis3[32];
+
+// Inicialización de Pantalla
+U8G2_ST7920_128X64_F_HW_SPI u8g2(U8G2_R0, OLED_CS_PIN, OLED_RESET_PIN);
+
+// Manejador de Tarea para Core 0
+TaskHandle_t SensorTaskHandle = NULL;
+
+// Declaración de funciones
+void drawAvatar(Emotion emo, int frame, int cx, int cy, float s);
+void drawMenu();
+void drawAbout();
+void drawHistoryUI();
+void drawTriageResult();
+void processInputs();
+Button readAnalogKeypad();
+void drawCenteredStr(int y, const char* text);
+void evaluateDiagnoses();
+void resetSessionData();
+
+// =================================================================
+// TAREA DEDICADA AL SENSOR (SE EJECUTA EN CORE 0)
+// =================================================================
+void sensorTaskCode(void * pvParameters) {
+  for (;;) {
+    if (currentState == STATE_TRIAGE_FINGER_READ) {
+      long irValue = particleSensor.getIR();
+      long redValue = particleSensor.getRed();
+
+      if (irValue < 50000) {
+        beatAvg = 0;
+        beatsPerMinute = 0;
+        spo2 = 0;
+        sampleCount = 0;
+        liveBPM = 0;
+        isSpO2ValidLive = false;
+        
+        if (millis() - noDetectionTimer > 10000) {
+          currentState = STATE_MENU;
+          currentEmotion = EMOTION_NORMAL;
+          needsRedraw = true;
+        }
+      } else {
+        noDetectionTimer = millis();
+        
+        bool beatDetected = checkForBeat(irValue);
+        if (beatDetected) {
+          long delta = millis() - lastBeat;
+          lastBeat = millis();
+          beatsPerMinute = 60 / (delta / 1000.0);
+
+          if (beatsPerMinute < 255 && beatsPerMinute > 40) {
+            rates[rateSpot++] = (byte)beatsPerMinute; 
+            rateSpot %= RATE_SIZE;
+            beatAvg = 0;
+            for (byte x = 0; x < RATE_SIZE; x++) beatAvg += rates[x];
+            beatAvg /= RATE_SIZE;
+          }
+        }
+
+        if (sampleCount < BUFFER_SIZE) {
+          redBuffer[sampleCount] = redValue;
+          irBuffer[sampleCount] = irValue;
+          sampleCount++;
+        } else {
+          maxim_heart_rate_and_oxygen_saturation(irBuffer, bufferLength, redBuffer, &spo2, &validSPO2, &dummyHeartRate, &validDummyHR);
+          for (int i = 50; i < BUFFER_SIZE; i++) {
+            redBuffer[i - 50] = redBuffer[i];
+            irBuffer[i - 50] = irBuffer[i];
+          }
+          sampleCount = 50;
+        }
+
+        int spo2Calibrado = spo2 - 3; 
+
+        liveBPM = beatAvg;
+        if (validSPO2 == 1 && spo2Calibrado >= 50 && spo2Calibrado <= 100) {
+          liveSpO2 = spo2Calibrado;
+          isSpO2ValidLive = true;
+          
+          if (liveBPM >= 40 && liveBPM <= 160) {
+            sumBPM += liveBPM;
+            sumSpO2 += liveSpO2;
+            validReadingsCount++;
+          }
+        } else {
+          isSpO2ValidLive = false;
+        }
+
+        // Lectura más lenta y estricta (exige más muestras para estabilizar)
+        if (validReadingsCount >= TARGET_VALID_READINGS) {
+          patientBPM = sumBPM / validReadingsCount;
+          patientSpO2 = sumSpO2 / validReadingsCount;
+          
+          currentState = STATE_TRIAGE_FINGER_HOLD;
+          holdTimer = millis(); 
+        }
+      }
+      vTaskDelay(2 / portTICK_PERIOD_MS);
+      
+    } else if (currentState == STATE_TRIAGE_WRIST_READ) {
+      liveTemp = mlx.readObjectTempC();
+      
+      if (liveTemp < 30.0) {
+        sumTemp = 0;
+        validTempCount = 0;
+        
+        if (millis() - noDetectionTimer > 10000) {
+          currentState = STATE_MENU;
+          currentEmotion = EMOTION_NORMAL;
+          needsRedraw = true;
+        }
+      } else {
+        noDetectionTimer = millis();
+        
+        sumTemp += liveTemp;
+        validTempCount++;
+        
+        // Estabilización de temperatura con más muestras
+        if (validTempCount >= TARGET_TEMP_READINGS) {
+          patientTemp = sumTemp / validTempCount;
+          
+          currentState = STATE_TRIAGE_WRIST_HOLD;
+          holdTimer = millis();
+        }
+      }
+      vTaskDelay(100 / portTICK_PERIOD_MS);
+
+    } else {
+      vTaskDelay(100 / portTICK_PERIOD_MS);
+    }
+  }
+}
+
+// =================================================================
+// SETUP (SE EJECUTA EN CORE 1)
+// =================================================================
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(21, 22);
+
+  u8g2.begin();
+  u8g2.enableUTF8Print();
+  u8g2.setBusClock(100000);  
+
+  if (particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+    particleSensor.setup();
+    particleSensor.setPulseAmplitudeRed(0x3F);
+    particleSensor.setPulseAmplitudeIR(0x3F);
+  }
+
+  mlx.begin();
+  
+  pinMode(KEYPAD_PIN, INPUT);
+  lastInteractionTime = millis();
+
+  xTaskCreatePinnedToCore(
+    sensorTaskCode,   
+    "SensorTask",     
+    8192,             
+    NULL,             
+    1,                
+    &SensorTaskHandle,
+    0                 
+  );
+}
+
+// =================================================================
+// LOOP PRINCIPAL (SE EJECUTA EN CORE 1 - UI)
+// =================================================================
+void loop() {
+  processInputs(); 
+
+  if (millis() - stateTimer > 50) {
+    animFrame++;
+    stateTimer = millis();
+    if (currentEmotion == EMOTION_NORMAL || currentEmotion == EMOTION_HAPPY) {
+      if (random(0, 60) == 1) isBlinking = true;
+      else if (isBlinking && random(0, 4) == 1) isBlinking = false;
+    } else {
+      isBlinking = false;
+    }
+    needsRedraw = true;
+  }
+
+  // Transición a lectura de dedo (Limpiando datos previos desde 0)
+  if (currentState == STATE_TRIAGE_FINGER_REQ && animFrame > 40) {
+    resetSessionData(); // Limpieza absoluta de variables residuales
+    currentState = STATE_TRIAGE_FINGER_READ;
+    currentEmotion = EMOTION_LOADING;
+    animFrame = 0;
+    noDetectionTimer = millis(); 
+  }
+
+  if (currentState == STATE_TRIAGE_FINGER_HOLD && millis() - holdTimer >= 5000) {
+    currentState = STATE_TRIAGE_WRIST_REQ;
+    currentEmotion = EMOTION_LOOK_UP; 
+    animFrame = 0;
+    needsRedraw = true;
+  }
+
+  if (currentState == STATE_TRIAGE_WRIST_REQ && animFrame > 40) {
+    currentState = STATE_TRIAGE_WRIST_READ;
+    currentEmotion = EMOTION_LOADING;
+    animFrame = 0;
+    sumTemp = 0.0;
+    validTempCount = 0;
+    noDetectionTimer = millis(); 
+  }
+
+  if (currentState == STATE_TRIAGE_WRIST_HOLD && millis() - holdTimer >= 5000) {
+    evaluateDiagnoses(); 
+    
+    // GUARDAR EN HISTORIAL (Rotar últimos 3 reportes)
+    historyReports[2] = historyReports[1];
+    historyReports[1] = historyReports[0];
+    historyReports[0] = {patientBPM, patientSpO2, patientTemp, true};
+    if (historyCount < 3) historyCount++;
+
+    currentState = STATE_TRIAGE_RESULT;
+    resultPage = 0;
+    
+    if (patientBPM > 100 || patientBPM < 60 || patientSpO2 < 92 || patientTemp > 37.5) {
+      currentEmotion = EMOTION_SAD; 
+    } else {
+      currentEmotion = EMOTION_HAPPY; 
+    }
+    needsRedraw = true;
+  }
+
+  if (currentState != STATE_IDLE_FACE && 
+      currentState != STATE_TRIAGE_FINGER_READ && 
+      currentState != STATE_TRIAGE_FINGER_HOLD && 
+      currentState != STATE_TRIAGE_WRIST_REQ && 
+      currentState != STATE_TRIAGE_WRIST_READ && 
+      currentState != STATE_TRIAGE_WRIST_HOLD && 
+      (millis() - lastInteractionTime > INACTIVITY_TIMEOUT)) {
+    currentState = STATE_IDLE_FACE;
+    currentEmotion = EMOTION_NORMAL;
+    needsRedraw = true;
+  }
+
+  if (needsRedraw) {
+    u8g2.clearBuffer();
+    switch (currentState) {
+      case STATE_IDLE_FACE: 
+        drawAvatar(currentEmotion, animFrame, 64, 32, 1.0); 
+        break;
+      case STATE_MENU: 
+        drawMenu(); 
+        break;
+      case STATE_ABOUT: 
+        drawAbout(); 
+        break;
+      case STATE_HISTORY:
+        drawHistoryUI();
+        break;
+        
+      case STATE_TRIAGE_FINGER_REQ:
+        drawAvatar(EMOTION_LOOK_DOWN, animFrame, 64, 20, 0.65);
+        u8g2.setFont(u8g2_font_6x10_tr);
+        drawCenteredStr(50, "Coloque su dedo"); 
+        drawCenteredStr(62, "sobre el sensor"); 
+        break;
+        
+      case STATE_TRIAGE_FINGER_READ: {
+        drawAvatar(EMOTION_LOADING, animFrame, 64, 18, 0.60);
+        u8g2.setFont(u8g2_font_6x10_tr);
+        
+        if (liveBPM == 0 && !isSpO2ValidLive) {
+          drawCenteredStr(56, "Esperando dedo...");
+        } else {
+          char buf[32];
+          if (liveBPM > 0) sprintf(buf, "BPM: %d", liveBPM);
+          else sprintf(buf, "BPM: Estabilizando");
+          drawCenteredStr(46, buf);
+          
+          if (isSpO2ValidLive) sprintf(buf, "SpO2: %d%%", liveSpO2);
+          else sprintf(buf, "SpO2: Estabilizando");
+          drawCenteredStr(58, buf);
+        }
+        break;
+      }
+
+      case STATE_TRIAGE_FINGER_HOLD: {
+        drawAvatar(EMOTION_HAPPY, animFrame, 64, 18, 0.60);
+        u8g2.setFont(u8g2_font_6x10_tr);
+        char buf[32];
+        sprintf(buf, "BPM: %d", patientBPM);
+        drawCenteredStr(46, buf);
+        sprintf(buf, "SpO2: %d%%", patientSpO2);
+        drawCenteredStr(58, buf);
+        break;
+      }
+
+      case STATE_TRIAGE_WRIST_REQ: {
+        drawAvatar(EMOTION_LOOK_UP, animFrame, 64, 20, 0.65);
+        u8g2.setFont(u8g2_font_6x10_tr);
+        drawCenteredStr(50, "Coloque su muneca"); 
+        drawCenteredStr(62, "en el sensor"); 
+        break;
+      }
+
+      case STATE_TRIAGE_WRIST_READ: {
+        drawAvatar(EMOTION_LOADING, animFrame, 64, 18, 0.60);
+        u8g2.setFont(u8g2_font_6x10_tr);
+        
+        if (liveTemp < 30.0) {
+          drawCenteredStr(56, "Esperando muneca...");
+        } else {
+          char buf[32];
+          sprintf(buf, "Temp: %.1f C", liveTemp);
+          drawCenteredStr(52, buf);
+        }
+        break;
+      }
+
+      case STATE_TRIAGE_WRIST_HOLD: {
+        drawAvatar(EMOTION_HAPPY, animFrame, 64, 18, 0.60);
+        u8g2.setFont(u8g2_font_6x10_tr);
+        char buf[32];
+        sprintf(buf, "Temp: %.1f C", patientTemp);
+        drawCenteredStr(52, buf);
+        break;
+      }
+
+      case STATE_TRIAGE_RESULT:
+        drawTriageResult();
+        break;
+    }
+    u8g2.sendBuffer();
+    needsRedraw = false;
+  }
+}
+
+// --- LIMPIEZA ABSOLUTA DE VARIABLES DE SESIÓN ---
+void resetSessionData() {
+  patientBPM = 0;
+  patientSpO2 = 0;
+  patientTemp = 0.0;
+  sumBPM = 0;
+  sumSpO2 = 0;
+  validReadingsCount = 0;
+  sumTemp = 0.0;
+  validTempCount = 0;
+  liveBPM = 0;
+  liveSpO2 = 0;
+  liveTemp = 0.0;
+  isSpO2ValidLive = false;
+  sampleCount = 0;
+}
+
+// --- EVALUACIÓN DE DIAGNÓSTICOS ---
+void evaluateDiagnoses() {
+  if (patientBPM > 100) {
+    snprintf(diagnosis1, sizeof(diagnosis1), "1. Ritmo cardiaco acelerado");
+  } else if (patientBPM < 60) {
+    snprintf(diagnosis1, sizeof(diagnosis1), "1. Ritmo cardiaco lento");
+  } else {
+    snprintf(diagnosis1, sizeof(diagnosis1), "1. Ritmo cardiaco normal");
+  }
+
+  if (patientSpO2 < 92) {
+    snprintf(diagnosis2, sizeof(diagnosis2), "2. Oxigeno bajo (Alerta)");
+  } else if (patientSpO2 <= 94) {
+    snprintf(diagnosis2, sizeof(diagnosis2), "2. Oxigeno algo bajo");
+  } else {
+    snprintf(diagnosis2, sizeof(diagnosis2), "2. Nivel de oxigeno normal");
+  }
+
+  snprintf(diagnosis3, sizeof(diagnosis3), "3. Temp: %.1f C (Estable)", patientTemp);
+}
+
+// --- CONTROLES Y TECLADO ---
+Button readAnalogKeypad() {
+  int adc = analogRead(KEYPAD_PIN);
+  if (adc < 100) return BTN_DOWN;
+  if (adc > 700 && adc < 950) return BTN_BACK;
+  if (adc > 1700 && adc < 1950) return BTN_OK;
+  if (adc > 2900 && adc < 3150) return BTN_UP;
+  return BTN_NONE;
+}
+
+void processInputs() {
+  if (millis() - lastButtonTime < DEBOUNCE_DELAY) return;
+  Button btn = readAnalogKeypad();
+  if (btn == BTN_NONE) return;
+
+  lastButtonTime = millis();
+  lastInteractionTime = millis();
+  needsRedraw = true;
+
+  if (currentState == STATE_IDLE_FACE) {
+    currentState = STATE_MENU;
+    return;
+  }
+
+  switch (currentState) {
+    case STATE_MENU:
+      if (btn == BTN_UP)   mainMenuSelection = (mainMenuSelection == 0) ? 2 : mainMenuSelection - 1;
+      if (btn == BTN_DOWN) mainMenuSelection = (mainMenuSelection == 2) ? 0 : mainMenuSelection + 1;
+      if (btn == BTN_BACK) currentState = STATE_IDLE_FACE;
+      if (btn == BTN_OK) {
+        if (mainMenuSelection == 0) {
+          currentState = STATE_TRIAGE_FINGER_REQ; 
+          currentEmotion = EMOTION_LOOK_DOWN;
+          animFrame = 0;
+        } else if (mainMenuSelection == 1) {
+          currentState = STATE_HISTORY;
+          historyPage = 0;
+        } else {
+          currentState = STATE_ABOUT;
+          aboutPage = 0; 
+        }
+      }
+      break;
+
+    case STATE_HISTORY:
+      if (btn == BTN_UP || btn == BTN_DOWN) {
+        historyPage = (historyPage + 1) % 3; // Navegar entre los 3 reportes
+      }
+      if (btn == BTN_BACK || btn == BTN_OK) currentState = STATE_MENU;
+      break;
+
+    case STATE_ABOUT:
+      if (btn == BTN_DOWN) aboutPage = 1;
+      if (btn == BTN_UP)   aboutPage = 0;
+      if (btn == BTN_BACK || btn == BTN_OK) currentState = STATE_MENU;
+      break;
+
+    case STATE_TRIAGE_RESULT:
+      if (btn == BTN_UP || btn == BTN_DOWN) {
+        resultPage = (resultPage == 0) ? 1 : 0; 
+      }
+      if (btn == BTN_BACK || btn == BTN_OK) {
+        currentState = STATE_MENU;
+        currentEmotion = EMOTION_NORMAL;
+      }
+      break;
+  }
+}
+
+// --- DIBUJO DE LA CARA ---
+void drawAvatar(Emotion emo, int frame, int cx, int cy, float s) {
+  if (emo == EMOTION_NORMAL || emo == EMOTION_HAPPY) {
+    int bounce = (int)(sin(millis() / 300.0) * (3.0 * s));
+    cy += bounce;
+  }
+
+  int eW = max(1, (int)(22 * s));
+  int eH = max(1, (int)(26 * s));
+  int lx = cx - (int)(23 * s) - eW/2;
+  int rx = cx + (int)(23 * s) - eW/2;
+  int ey = cy - (int)(14 * s);
+  int mx = cx;
+  int my = cy + (int)(18 * s);
+  int rad = max(1, (int)(5 * s));
+
+  int ebY = cy - (int)(20 * s); 
+  u8g2.setDrawColor(1);
+  if (emo == EMOTION_SAD) {
+    u8g2.drawLine(lx, ebY, lx + eW, ebY + (int)(4*s));
+    u8g2.drawLine(rx, ebY + (int)(4*s), rx + eW, ebY);
+  } else if (emo == EMOTION_HAPPY) {
+    u8g2.drawBox(lx + (int)(2*s), ebY - (int)(3*s), eW - (int)(4*s), max(1, (int)(3*s)));
+    u8g2.drawBox(rx + (int)(2*s), ebY - (int)(3*s), eW - (int)(4*s), max(1, (int)(3*s)));
+  } else {
+    u8g2.drawBox(lx + (int)(2*s), ebY, eW - (int)(4*s), max(1, (int)(2*s)));
+    u8g2.drawBox(rx + (int)(2*s), ebY, eW - (int)(4*s), max(1, (int)(2*s)));
+  }
+
+  if (isBlinking) {
+    u8g2.drawRBox(lx, ey + eH/2 - (int)(3*s), eW, max(1, (int)(6*s)), max(1, (int)(2*s)));
+    u8g2.drawRBox(rx, ey + eH/2 - (int)(3*s), eW, max(1, (int)(6*s)), max(1, (int)(2*s)));
+  } else {
+    u8g2.drawRBox(lx, ey, eW, eH, rad);
+    u8g2.drawRBox(rx, ey, eW, eH, rad);
+
+    u8g2.setDrawColor(0);
+    if (emo == EMOTION_HAPPY) { 
+       u8g2.drawBox(lx - 1, ey + eH/2, eW + 2, eH/2 + 2);
+       u8g2.drawBox(rx - 1, ey + eH/2, eW + 2, eH/2 + 2);
+    }
+    
+    int pW = max(1, (int)(8 * s)); 
+    int pxOff = (eW - pW) / 2;
+    int pyOff = (eH - pW) / 2;
+    
+    int lookX = 0;
+    if (emo == EMOTION_NORMAL) {
+      int cicloMirada = (frame / 20) % 10; 
+      if (cicloMirada == 1) lookX = -(int)(3 * s); 
+      else if (cicloMirada == 5) lookX = (int)(3 * s); 
+    }
+
+    if (emo == EMOTION_LOOK_DOWN) pyOff = eH - pW - (int)(2*s);
+    else if (emo == EMOTION_LOOK_UP) pyOff = (int)(2*s);
+    
+    if (emo == EMOTION_LOADING) {
+      int animOff = ((frame % 20) - 10) * s;
+      u8g2.drawBox(lx + pxOff, ey + pyOff + animOff, pW, pW);
+      u8g2.drawBox(rx + pxOff, ey + pyOff - animOff, pW, pW);
+    } else if (emo != EMOTION_HAPPY) {
+      u8g2.drawBox(lx + pxOff + lookX, ey + pyOff, pW, pW);
+      u8g2.drawBox(rx + pxOff + lookX, ey + pyOff, pW, pW);
+    }
+  }
+
+  u8g2.setDrawColor(1);
+  int mRad = max(1, (int)(6 * s));
+  if (emo == EMOTION_HAPPY) {
+    u8g2.drawDisc(mx, my, mRad);
+    u8g2.setDrawColor(0);
+    u8g2.drawBox(mx - mRad - 1, my - mRad - 1, (mRad*2)+2, mRad+2);
+  } else if (emo == EMOTION_SAD) {
+    u8g2.drawDisc(mx, my + (int)(3*s), mRad);
+    u8g2.setDrawColor(0);
+    u8g2.drawBox(mx - mRad - 1, my + (int)(3*s), (mRad*2)+2, mRad+1);
+  } else if (emo == EMOTION_LOOK_DOWN || emo == EMOTION_LOOK_UP || emo == EMOTION_LOADING) {
+    u8g2.drawCircle(mx, my + (int)(2*s), max(1, (int)(3*s)));
+  } else {
+    u8g2.drawDisc(mx, my, max(1, (int)(5*s)));
+    u8g2.setDrawColor(0);
+    u8g2.drawBox(mx - (int)(6*s), my - (int)(6*s), (int)(12*s), (int)(7*s));
+  }
+  u8g2.setDrawColor(1); 
+}
+
+// --- INTERFAZ UI ---
+void drawCenteredStr(int y, const char* text) {
+  u8g2.drawStr((128 - u8g2.getStrWidth(text)) / 2, y, text);
+}
+
+void drawMenu() {
+  u8g2.setFont(u8g2_font_helvB08_tr);
+  drawCenteredStr(10, "MEDIBOT");
+  u8g2.drawHLine(0, 13, 128);
+
+  u8g2.setFont(u8g2_font_6x10_tr);
+  int cardX = 10, cardW = 108, cardH = 14;
+  
+  // Opción 0: Auto-Chequeo
+  int y1 = 17;
+  if (mainMenuSelection == 0) {
+    u8g2.drawRBox(cardX, y1, cardW, cardH, 2);
+    u8g2.setDrawColor(0);
+    drawCenteredStr(y1 + 11, "Auto-Chequeo");
+    u8g2.setDrawColor(1);
+  } else {
+    u8g2.drawRFrame(cardX, y1, cardW, cardH, 2);
+    drawCenteredStr(y1 + 11, "Auto-Chequeo");
+  }
+
+  // Opción 1: Historial
+  int y2 = 33;
+  if (mainMenuSelection == 1) {
+    u8g2.drawRBox(cardX, y2, cardW, cardH, 2);
+    u8g2.setDrawColor(0);
+    drawCenteredStr(y2 + 11, "Historial");
+    u8g2.setDrawColor(1);
+  } else {
+    u8g2.drawRFrame(cardX, y2, cardW, cardH, 2);
+    drawCenteredStr(y2 + 11, "Historial");
+  }
+
+  // Opción 2: Sobre Medibot
+  int y3 = 49;
+  if (mainMenuSelection == 2) {
+    u8g2.drawRBox(cardX, y3, cardW, cardH, 2);
+    u8g2.setDrawColor(0);
+    drawCenteredStr(y3 + 11, "Sobre Medibot");
+    u8g2.setDrawColor(1);
+  } else {
+    u8g2.drawRFrame(cardX, y3, cardW, cardH, 2);
+    drawCenteredStr(y3 + 11, "Sobre Medibot");
+  }
+}
+
+void drawAbout() {
+  u8g2.setFont(u8g2_font_helvB08_tr);
+  drawCenteredStr(10, "INFO MEDIBOT");
+  u8g2.drawHLine(0, 13, 128);
+  
+  u8g2.setFont(u8g2_font_5x7_tr);
+  if (aboutPage == 0) {
+    u8g2.drawStr(2, 25, "MEDIBOT ayuda a");
+    u8g2.drawStr(2, 35, "medir tus signos");
+    u8g2.drawStr(2, 45, "vitales de forma");
+    u8g2.drawStr(2, 55, "rapida y sencilla.");
+    u8g2.drawTriangle(120, 52, 126, 52, 123, 56); 
+  } else {
+    u8g2.drawStr(2, 25, "Este robot no");
+    u8g2.drawStr(2, 35, "reemplaza a un");
+    u8g2.drawStr(2, 45, "doctor real.");
+    u8g2.drawStr(2, 55, "Uso referencial.");
+    u8g2.drawTriangle(120, 26, 126, 26, 123, 22); 
+  }
+  
+  u8g2.setFont(u8g2_font_4x6_tr);
+  u8g2.drawStr(70, 63, "[BACK] Salir");
+}
+
+void drawHistoryUI() {
+  u8g2.setFont(u8g2_font_helvB08_tr);
+  char titleBuf[24];
+  sprintf(titleBuf, "HISTORIAL (%d/3)", historyPage + 1);
+  drawCenteredStr(10, titleBuf);
+  u8g2.drawHLine(0, 12, 128);
+
+  u8g2.setFont(u8g2_font_6x10_tr);
+  if (historyCount == 0 || !historyReports[historyPage].recorded) {
+    drawCenteredStr(38, "Sin registros aun");
+  } else {
+    char buf[32];
+    sprintf(buf, "Latidos: %d x min", historyReports[historyPage].bpm);
+    u8g2.drawStr(4, 28, buf);
+    
+    sprintf(buf, "Oxigeno: %d%%", historyReports[historyPage].spo2);
+    u8g2.drawStr(4, 42, buf);
+
+    sprintf(buf, "Temp: %.1f C", historyReports[historyPage].temp);
+    u8g2.drawStr(4, 56, buf);
+  }
+
+  u8g2.setFont(u8g2_font_4x6_tr);
+  u8g2.drawStr(40, 63, "[UP/DWN] Ver [BACK] Salir");
+}
+
+void drawTriageResult() {
+  u8g2.setFont(u8g2_font_helvB08_tr);
+  if (resultPage == 0) {
+    drawCenteredStr(10, "TUS RESULTADOS");
+    u8g2.drawHLine(0, 12, 128);
+
+    char buf[32];
+    u8g2.setFont(u8g2_font_6x10_tr);
+    sprintf(buf, "Latidos: %d x min", patientBPM);
+    u8g2.drawStr(4, 26, buf);
+    
+    sprintf(buf, "Oxigeno: %d%%", patientSpO2);
+    u8g2.drawStr(4, 40, buf);
+
+    sprintf(buf, "Temp: %.1f C", patientTemp);
+    u8g2.drawStr(4, 54, buf);
+
+    u8g2.setFont(u8g2_font_4x6_tr);
+    u8g2.drawStr(60, 63, "[UP/DWN] Posibles Causas");
+  } else {
+    drawCenteredStr(10, "POSIBLES CAUSAS");
+    u8g2.drawHLine(0, 12, 128);
+
+    u8g2.setFont(u8g2_font_4x6_tr);
+    u8g2.drawStr(2, 24, diagnosis1);
+    u8g2.drawStr(2, 38, diagnosis2);
+    u8g2.drawStr(2, 52, diagnosis3);
+
+    u8g2.drawStr(50, 63, "[OK] Inicio [UP/DWN] Valores");
+  }
+}
